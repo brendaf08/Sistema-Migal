@@ -34,6 +34,57 @@ class TestAgenteSuministro(TransactionCase):
         res = self._agente(self.cmp).ejecutar_herramienta("consultar_recepcion", {"orden_compra": self.po.name})
         self.assertEqual(res["estado"], "pendiente")
 
+    def test_ev018_alerta_stock_previsto_por_orden(self):
+        almacen = self.po.picking_type_id.warehouse_id
+        ubicacion = almacen.lot_stock_id
+        producto = self.env["product.product"].create({
+            "name": "[PRUEBA] Cemento EV-018",
+            "is_storable": True,
+            "list_price": 10,
+        })
+        otro = self.env["product.product"].create({
+            "name": "[PRUEBA] Producto ajeno EV-018",
+            "is_storable": True,
+        })
+        self.env["stock.quant"]._update_available_quantity(producto, ubicacion, 110)
+        for candidato in producto | otro:
+            self.env["stock.warehouse.orderpoint"].create({
+                "product_id": candidato.id,
+                "warehouse_id": almacen.id,
+                "location_id": ubicacion.id,
+                "product_min_qty": 100,
+                "product_max_qty": 200,
+                "trigger": "manual",
+            })
+
+        for cantidad, espera_alerta in [(10, False), (25, True)]:
+            orden = self.env["sale.order"].create({
+                "partner_id": self.proveedor.id,
+                "warehouse_id": almacen.id,
+                "user_id": self.ven.id,
+                "order_line": [Command.create({"product_id": producto.id, "product_uom_qty": cantidad})],
+            })
+            notas = self.env["mail.message"].sudo()
+            dominio = [
+                ("model", "=", "sale.order"),
+                ("res_id", "=", orden.id),
+                ("subject", "=", "EV-018 · Alerta de reposición"),
+            ]
+            self.assertFalse(notas.search(dominio))
+            orden.with_user(self.ven).action_confirm()
+            self.assertEqual(orden.state, "sale")
+            nota = notas.search(dominio)
+            self.assertEqual(len(nota), int(espera_alerta))
+            if nota:
+                self.assertEqual(nota.subtype_id, self.env.ref("mail.mt_note"))
+                self.assertIn("Previsto: 75", nota.body)
+                self.assertIn("Mínimo: 100", nota.body)
+                self.assertNotIn(otro.name, nota.body)
+                self.env["migal.agente.suministro"].with_user(self.ven)._al_confirmarse_venta({
+                    "orden": orden.name,
+                })
+                self.assertEqual(notas.search_count(dominio), 1)
+
     def test_recepcion_parcial_emite_ev027(self):
         picking = self.po.picking_ids
         picking.move_ids.quantity = 6

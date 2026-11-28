@@ -8,8 +8,11 @@ proveedores, despachos pendientes y recepción con OCR de la guía.
 import logging
 import re
 
+from markupsafe import Markup
+
 from odoo import models
 from odoo.tools import format_date
+from odoo.tools.float_utils import float_compare
 
 from odoo.addons.migal_agente.agent.contracts import DATE, ORDER_REF
 
@@ -142,5 +145,64 @@ class AgenteSuministro(models.AbstractModel):
     # Eventos
     # ------------------------------------------------------------------
     def _al_confirmarse_venta(self, datos):
-        """EV-018. Por hacer: preparar el despacho y revisar si la venta deja productos bajo el mínimo."""
-        _logger.info("Agente suministro: EV-018 recibido para %s.", datos.get("orden"))
+        """EV-018. Deja una nota interna si la salida deja stock previsto bajo el mínimo."""
+        referencia = datos.get("orden")
+        if not referencia:
+            return
+
+        orden = self.env["sale.order"].search([
+            ("name", "=", referencia),
+            ("company_id", "in", self.env.companies.ids),
+            ("state", "=", "sale"),
+        ], limit=2)
+        if len(orden) != 1 or not orden.warehouse_id.lot_stock_id:
+            return
+
+        orden = orden.with_company(orden.company_id)
+        asunto = "EV-018 · Alerta de reposición"
+        if self.env["mail.message"].search_count([
+            ("model", "=", orden._name),
+            ("res_id", "=", orden.id),
+            ("subject", "=", asunto),
+        ], limit=1):
+            return
+
+        movimientos = orden.order_line.move_ids.filtered(
+            lambda m: m.state != "cancel" and m.location_id.usage == "internal"
+        )
+        if not movimientos:
+            return
+
+        reglas = self.env["stock.warehouse.orderpoint"].with_company(orden.company_id).search([
+            ("company_id", "=", orden.company_id.id),
+            ("location_id", "child_of", orden.warehouse_id.lot_stock_id.id),
+            ("location_id", "parent_of", movimientos.location_id.ids),
+            ("product_id", "in", movimientos.product_id.ids),
+            ("trigger", "=", "manual"),
+        ])
+        origenes_por_producto = {}
+        for movimiento in movimientos:
+            origenes_por_producto.setdefault(movimiento.product_id.id, set()).update(
+                int(ubicacion) for ubicacion in movimiento.location_id.parent_path.split("/") if ubicacion
+            )
+        reglas = reglas.filtered(
+            lambda regla: regla.location_id.id in origenes_por_producto[regla.product_id.id]
+        )
+        filas = []
+        for regla in reglas:
+            previsto = regla.qty_forecast
+            minimo = regla.product_min_qty
+            if float_compare(previsto, minimo, precision_rounding=regla.product_uom.rounding) >= 0:
+                continue
+            filas.append(Markup("<li><strong>%s</strong> · %s · Previsto: %g %s · Mínimo: %g %s</li>") % (
+                regla.product_id.display_name, regla.location_id.complete_name,
+                previsto, regla.product_uom.name, minimo, regla.product_uom.name,
+            ))
+
+        if filas:
+            cuerpo = Markup(
+                "<p><strong>EV-018 · Alerta de reposición</strong></p>"
+                "<p>Productos de esta venta con stock previsto bajo el mínimo. "
+                "Compras o Almacén pueden revisar la reposición.</p><ul>%s</ul>"
+            ) % Markup("").join(filas)
+            orden.message_post(body=cuerpo, subject=asunto, subtype_xmlid="mail.mt_note")
