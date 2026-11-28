@@ -385,20 +385,23 @@ class TestEstadoCuentaPublico(HttpCase):
 
     def test_ruta_publica(self):
         partner = self.env["res.partner"].create({"name": "PC3 Cliente Público"})
-        Pub = self.env["migal.agente.estado.cuenta.publicacion"].sudo()
+        fco = new_test_user(self.env, login="fco_pc3_publico", groups="account.group_account_invoice")
+        Pub = self.env["migal.agente.estado.cuenta.publicacion"].with_user(fco)
         datos = {"cliente": partner.name, "simbolo": "S/", "fecha_desde": "2026-11-01", "fecha_hasta": "2026-11-13",
                  "fecha_consulta": "2026-11-13", "saldo_anterior": 0, "movimientos": [], "saldo_periodo": 0,
                  "documentos_pendientes": [], "pagos_sin_aplicar": [], "total_pendiente": 0, "total_vencido": 0,
                  "informativo": [], "antiguedad": []}
-        pub = Pub.create({"partner_id": partner.id, "datos_json": json.dumps(datos)})
+        vals = {"partner_id": partner.id, "datos_json": json.dumps(datos)}
+        pub = Pub._create_validated(vals, user=fco)
         r = self.url_open("/migal/estado-cuenta/%s" % pub.token)
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.headers["Content-Type"], "application/pdf")
         self.assertIn("no-store", r.headers["Cache-Control"])
         self.assertEqual(pub.vistas, 1)
         self.assertEqual(self.url_open("/migal/estado-cuenta/00000000-0000-0000-0000-000000000000").status_code, 404)
-        pub.expira = fields.Datetime.now() - timedelta(minutes=1)
+        vencida = Pub._create_validated(
+            dict(vals, expira=fields.Datetime.now() - timedelta(minutes=1)), user=fco,
+        )
+        self.assertEqual(self.url_open("/migal/estado-cuenta/%s" % vencida.token).status_code, 404)
+        pub.action_revocar()
         self.assertEqual(self.url_open("/migal/estado-cuenta/%s" % pub.token).status_code, 404)
-        pub.write({"expira": fields.Datetime.now() + timedelta(hours=1), "activo": False})
-        self.assertEqual(self.url_open("/migal/estado-cuenta/%s" % pub.token).status_code, 404)
-

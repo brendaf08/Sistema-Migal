@@ -2,6 +2,7 @@ import logging
 from datetime import timedelta
 
 import odoo.modules.module
+from psycopg2 import errors as pg_errors
 from odoo import api, fields, models
 
 _logger = logging.getLogger(__name__)
@@ -24,20 +25,6 @@ class MigalAgenteRateLimit(models.Model):
 
     _key_uniq = models.Constraint("unique(key)", "La clave de rate limit debe ser única.")
 
-    _index_ensured = False
-
-    @api.model
-    def _ensure_key_index(self):
-        # Compatibilidad: tablas creadas antes del Constraint Odoo 19.
-        if self.__class__._index_ensured:
-            return
-        self.env.cr.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS migal_agente_rate_limit_key_uniq
-            ON migal_agente_rate_limit (key)
-            """
-        )
-        self.__class__._index_ensured = True
 
     @api.model
     def check_and_hit(self, key, limit, window_seconds):
@@ -70,43 +57,25 @@ class MigalAgenteRateLimit(models.Model):
             RETURNING count, window_start
         """
         params = (key, now, uid, now, uid, now, cutoff, cutoff, now)
-        # Cursor independiente para persistir conteo aunque la request termine en 404/rollback.
-        # Producción: registry.cursor() devuelve un Cursor real independiente; en Odoo 19 __exit__ hace commit+close.
-        # Test mode: registry.cursor() está parcheado por el arnés de tests para devolver TestCursor (savepoint);
-        # un commit en TestCursor no persiste ante rollback 404. Se usa registry._db.cursor() (Cursor real del pool,
-        # no parcheado) para persistir el contador en una transacción DB independiente.
-        # Detección: odoo.modules.module.current_test es establecido por el runner de tests de Odoo 19.
-        in_test_mode = bool(getattr(odoo.modules.module, "current_test", False))
-        from psycopg2 import errors as pg_errors  # noqa: PLC0415
-
-        last_exc = None
-        for attempt in range(3):
+        # El contador persiste incluso si la solicitud termina en 404.
+        # HttpCase parchea registry.cursor con savepoints. En ese caso se
+        # usa un cursor real del pool para poder confirmar el incremento.
+        registry = self.env.registry
+        en_prueba = bool(getattr(odoo.modules.module, "current_test", False))
+        nuevo_cursor = registry._db.cursor if en_prueba else registry.cursor
+        for intento in range(3):
             try:
-                if in_test_mode:
-                    with self.env.registry._db.cursor() as cr:
-                        cr.execute(
-                            "CREATE UNIQUE INDEX IF NOT EXISTS migal_agente_rate_limit_key_uniq ON migal_agente_rate_limit (key)"
-                        )
-                        cr.execute(sql, params)
-                        count, window_start = cr.fetchone()
-                        cr.commit()
-                else:
-                    with self.env.registry.cursor() as cr:
-                        cr.execute(
-                            "CREATE UNIQUE INDEX IF NOT EXISTS migal_agente_rate_limit_key_uniq ON migal_agente_rate_limit (key)"
-                        )
-                        cr.execute(sql, params)
-                        count, window_start = cr.fetchone()
-                        # Commit explícito en cursor independiente para robustez (además del commit de __exit__).
-                        cr.commit()
-                last_exc = None
+                with nuevo_cursor() as cr:
+                    # El UPSERT actualiza una sola fila y cuenta sobre su
+                    # última versión confirmada. Este nivel solo se aplica
+                    # a la transacción independiente del contador.
+                    cr.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                    cr.execute(sql, params)
+                    count, window_start = cr.fetchone()
                 break
-            except (pg_errors.DeadlockDetected, pg_errors.SerializationFailure) as exc:
-                last_exc = exc
-                if attempt == 2:
+            except (pg_errors.DeadlockDetected, pg_errors.SerializationFailure):
+                if intento == 2:
                     raise
-        if last_exc is not None:
-            raise last_exc
         if count > limit:
             elapsed = (now - window_start).total_seconds()
             retry_after = max(1, int(window_seconds - elapsed))
