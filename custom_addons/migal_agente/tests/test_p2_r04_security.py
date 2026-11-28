@@ -5,7 +5,7 @@ from unittest.mock import patch
 import threading
 
 from odoo import api, fields
-from odoo.tests import HttpCase, TransactionCase, tagged
+from odoo.tests import HttpCase, TransactionCase, new_test_user, tagged
 
 
 @tagged("post_install", "-at_install", "p2_r04")
@@ -16,7 +16,8 @@ class TestEstadoCuentaPublicoR04(HttpCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.partner = cls.env["res.partner"].create({"name": "Cliente P2 R04"})
-        cls.Pub = cls.env["migal.agente.estado.cuenta.publicacion"].sudo()
+        cls.fco = new_test_user(cls.env, login="fco_publico_r04", groups="account.group_account_invoice")
+        cls.Pub = cls.env["migal.agente.estado.cuenta.publicacion"].with_user(cls.fco)
         cls.datos = {
             "cliente": cls.partner.name, "simbolo": "S/", "fecha_desde": "2026-11-01",
             "fecha_hasta": "2026-11-13", "fecha_consulta": "2026-11-13", "saldo_anterior": 0,
@@ -40,7 +41,7 @@ class TestEstadoCuentaPublicoR04(HttpCase):
     def _pub(self, **kw):
         vals = {"partner_id": self.partner.id, "datos_json": json.dumps(self.datos)}
         vals.update(kw)
-        return self.Pub.create(vals)
+        return self.Pub._create_validated(vals, user=self.fco)
 
     def _get(self, token, ip="10.10.10.1"):
         with patch(
