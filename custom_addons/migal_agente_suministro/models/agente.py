@@ -7,6 +7,7 @@ proveedores, despachos pendientes y recepción con OCR de la guía.
 """
 from collections import defaultdict
 import logging
+from datetime import timedelta
 import re
 
 from markupsafe import Markup
@@ -35,6 +36,19 @@ class AgenteSuministro(models.AbstractModel):
     # ------------------------------------------------------------------
     def _herramientas(self):
         return {
+            "consultar_disponibilidad_producto": {
+                "description": "Muestra existencia, reservas y cantidad libre por ubicación.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"producto": {"type": "string", "minLength": 1}},
+                    "required": ["producto"],
+                    "additionalProperties": False,
+                },
+                "roles": ["VEN", "ALM", "CMP", "GER"],
+                "escritura": "Ninguna (solo bitácora).",
+                "reglas": ["RN-015"],
+                "metodo": "consultar_disponibilidad_producto",
+            },
             "evaluar_cobertura_preliminar": {
                 "description": (
                     "Revisa por producto y cantidad si una cotización vigente puede cubrirse con el stock "
@@ -91,12 +105,31 @@ class AgenteSuministro(models.AbstractModel):
                 "reglas": ["RN-013"],
                 "metodo": "consultar_recepcion",
             },
+            "consultar_baja_rotacion": {
+                "description": "Productos con existencias y sin salidas de venta validadas en los últimos días.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"dias": {"type": "integer", "minimum": 1, "maximum": 730}},
+                    "required": [],
+                    "additionalProperties": False,
+                },
+                "roles": ["VEN", "GER", "ALM"],
+                "escritura": "Ninguna (solo bitácora).",
+                "reglas": ["RN-022"],
+                "metodo": "consultar_baja_rotacion",
+            },
         }
 
     def _eventos_escuchados(self):
         return {"EV-018": "_al_confirmarse_venta"}
 
     def _reconocer(self, texto):
+        m = re.fullmatch(
+            r"(?:disponibilidad de|cuanto stock hay de)\s+(.+)",
+            texto.rstrip(" ?"),
+        )
+        if m:
+            return "consultar_disponibilidad_producto", {"producto": m.group(1).strip()}
         m = re.search(r"\b(recepcion|recibido|llego)\b.*\b(p\d{5})\b", texto)
         if m:
             return "consultar_recepcion", {"orden_compra": m.group(2).upper()}
@@ -115,6 +148,10 @@ class AgenteSuministro(models.AbstractModel):
             return "diagnosticar_faltantes", {"cotizacion": m.group(1).upper(), "fecha_requerida": m.group(2)}
         if re.search(r"\b(compras? pendientes?|ordenes? de compra|que falta recibir|por recibir|oc pendientes?)\b", texto):
             return "listar_compras_pendientes", {}
+        m = re.fullmatch(r"inventario sin ventas(?: (?:en )?(\d+) dias)?", texto.rstrip(" ?"))
+        if m:
+            dias = {"dias": int(m.group(1))} if m.group(1) else {}
+            return "consultar_baja_rotacion", dias
         return None
 
     def _acciones_widget(self, record):
@@ -133,6 +170,59 @@ class AgenteSuministro(models.AbstractModel):
     # ------------------------------------------------------------------
     def evaluar_cobertura_preliminar(self, cotizacion, fecha_requerida=None):
         return self.env["migal.agente.tool.cobertura"].evaluar(cotizacion, fecha_requerida)
+
+    def consultar_disponibilidad_producto(self, producto):
+        titulo = "Disponibilidad por ubicación"
+        consulta = producto.strip()
+        if not consulta:
+            return self._resultado(False, "error", titulo, "Escribe el nombre o la referencia del producto.")
+
+        compania = self.env.company
+        Producto = self.env["product.product"]
+        dominio = [("is_storable", "=", True), ("company_id", "in", [False, compania.id])]
+        patron = consulta.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        coincidencias = Producto.search(dominio + [("default_code", "=ilike", patron)], limit=10)
+        if not coincidencias:
+            coincidencias = Producto.search(dominio + [("name", "ilike", patron)], limit=10)
+
+        if not coincidencias:
+            return self._resultado(False, "error", titulo, f"No encontré un producto inventariable para «{consulta}».")
+
+        if len(coincidencias) > 1:
+            return self._resultado(
+                False, "ambiguo", titulo,
+                "Hay varias coincidencias. Repite la consulta con una referencia o un nombre más específico.",
+                datos={"tabla": {
+                    "columnas": ["Producto", "Referencia"],
+                    "filas": [[p.name, p.default_code or ""] for p in coincidencias],
+                }},
+            )
+
+        articulo = coincidencias
+        grupos = self.env["stock.quant"]._read_group(
+            [
+                ("product_id", "=", articulo.id),
+                ("company_id", "=", compania.id),
+                ("location_id.usage", "=", "internal"),
+            ],
+            groupby=["location_id"],
+            aggregates=["quantity:sum", "reserved_quantity:sum"],
+        )
+        filas = [
+            [ubicacion.complete_name, f"{existencia:g}", f"{reservada:g}", f"{existencia - reservada:g}"]
+            for ubicacion, existencia, reservada in sorted(grupos, key=lambda grupo: grupo[0].complete_name)
+        ]
+        mensaje = f"{articulo.display_name} · Unidad: {articulo.uom_id.name}."
+        if not filas:
+            mensaje += " No hay existencias registradas en las ubicaciones internas consultadas."
+
+        return self._resultado(
+            True, "ok", titulo, mensaje, reglas=["RN-015"],
+            datos={"tabla": {
+                "columnas": ["Ubicación", "Existencia", "Reservada", "Libre"],
+                "filas": filas,
+            }},
+        )
 
     def listar_compras_pendientes(self):
         hoy = self._hoy()
@@ -387,7 +477,61 @@ class AgenteSuministro(models.AbstractModel):
                                              "filas": [["%s" % p["producto"], "{:g}".format(p["pedido"]),
                                                         "{:g}".format(p["recibido"]), "{:g}".format(p["pendiente"])]
                                                        for p in productos]}})
-
+    def consultar_baja_rotacion(self, dias=90):
+        compania = self.env.company
+        existencias = self.env["stock.quant"]._read_group(
+            [
+                ("company_id", "=", compania.id),
+                ("location_id.usage", "=", "internal"),
+                ("product_id.active", "=", True),
+                ("product_id.is_storable", "=", True),
+            ],
+            groupby=["product_id"],
+            aggregates=["quantity:sum"],
+            having=[("quantity:sum", ">", 0)],
+        )
+        ahora = fields.Datetime.now()
+        salidas = self.env["stock.move"]._read_group(
+            [
+                ("company_id", "=", compania.id),
+                ("state", "=", "done"),
+                ("date", ">=", ahora - timedelta(days=dias)),
+                ("date", "<=", ahora),
+                ("quantity", ">", 0),
+                ("product_id", "in", [producto.id for producto, _stock in existencias]),
+                ("location_id.usage", "in", ["internal", "transit"]),
+                ("location_dest_id.usage", "=", "customer"),
+                "|",
+                ("sale_line_id", "!=", False),
+                ("picking_id.pos_session_id", "!=", False),
+            ],
+            groupby=["product_id"],
+        )
+        con_salidas = {producto.id for (producto,) in salidas}
+        productos = [
+            {
+                "producto": producto.display_name,
+                "stock": stock,
+                "vendido": 0,
+                "unidad": producto.uom_id.name,
+            }
+            for producto, stock in existencias
+            if producto.id not in con_salidas
+        ]
+        productos.sort(key=lambda producto: producto["producto"])
+        return self._resultado(
+            True, "ok", "Inventario sin ventas",
+            f"{len(productos)} productos con existencias y sin salidas de venta validadas en {dias} días.",
+            reglas=["RN-022"],
+            datos={
+                "dias": dias,
+                "productos": productos,
+                "tabla": {
+                    "columnas": ["Producto", "Stock", "Unidad", "Vendido"],
+                    "filas": [[p["producto"], f"{p['stock']:g}", p["unidad"], p["vendido"]] for p in productos],
+                },
+            },
+        )
     # ------------------------------------------------------------------
     # Eventos
     # ------------------------------------------------------------------
